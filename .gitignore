@@ -1,0 +1,7 @@
+testing-files/
+venv-wiki-views/
+db/
+.DS_Store
+cached/
+
+*.pyc
