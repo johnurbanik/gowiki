@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
-	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -88,7 +88,6 @@ func readFile(filePath string) {
 	defer fi.Close()
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	r, err := gzip.NewReader(fi)
@@ -117,7 +116,7 @@ func readFile(filePath string) {
 // ProcessLine parses and saves a line to the db
 func (counter *WikiPageCounter) ProcessLine(tokens []string, language string) {
 
-	if len(tokens) == 4 && strings.Index(tokens[1], ":") == -1 {
+	if len(tokens) == 4 && strings.Index(tokens[1], ":") == -1 && strings.Index(tokens[1], "?") == -1 {
 		pageTitle, _ := url.QueryUnescape(tokens[1])
 		if len(pageTitle) == 0 {
 			return
@@ -126,8 +125,9 @@ func (counter *WikiPageCounter) ProcessLine(tokens []string, language string) {
 
 		counter.mu.Lock()
 		counter.counter[pageTitle] += uint32(pageViews)
-		counter.mu.Unlock()
 		lineCount++
+		counter.mu.Unlock()
+
 	}
 }
 
@@ -145,7 +145,6 @@ func CreateCounter(language string) *WikiPageCounter {
 		_, _ = tx.CreateBucketIfNotExists([]byte("pages"))
 		return nil
 	})
-
 	counterMap[language] = &WikiPageCounter{
 		language: language,
 		counter:  make(map[string]uint32),
@@ -158,7 +157,7 @@ func CreateCounter(language string) *WikiPageCounter {
 // WriteToDB writes all values of a counter to its DB
 func WriteToDB(wpc *WikiPageCounter, date string) {
 	counter := wpc.counter
-	deque := lane.NewCappedDeque(1000)
+	deque := lane.NewCappedDeque(5000)
 	for title, views := range counter {
 		lineCount++
 		deque.Append(&dbPage{
@@ -166,6 +165,7 @@ func WriteToDB(wpc *WikiPageCounter, date string) {
 			pageViews: views,
 			key:       date,
 		})
+		delete(counter, title)
 		if deque.Full() {
 			writeFromDeque(deque, wpc)
 		}
@@ -176,23 +176,23 @@ func WriteToDB(wpc *WikiPageCounter, date string) {
 }
 
 func writeFromDeque(dq *lane.Deque, wpc *WikiPageCounter) {
-	var wg sync.WaitGroup
 
-	for !dq.Empty() {
-		wg.Add(1)
-		update := dq.Pop().(*dbPage)
-		go func(update *dbPage) {
-			defer wg.Done()
-			wpc.db.Batch(func(tx *Tx) error {
-				val := make([]byte, 4)
-				titleBucket := tx.Bucket([]byte("pages"))
-				binary.BigEndian.PutUint32(val, update.pageViews)
-				titleBucket.Put([]byte(update.pageTitle+"-"+update.key), val)
-				return nil
-			})
-		}(update)
-	}
-	wg.Wait()
+	wpc.db.Update(func(tx *Tx) error {
+		for !dq.Empty() {
+			update := dq.Pop().(*dbPage)
+			titleBucket := tx.Bucket([]byte("pages"))
+			timeSeries := make(map[string]uint32)
+			title := titleBucket.Get([]byte(update.pageTitle))
+			if title != nil {
+				json.Unmarshal(title, &timeSeries)
+			}
+			timeSeries[update.key] = update.pageViews
+			newVal, _ := json.Marshal(timeSeries)
+			titleBucket.Put([]byte(update.pageTitle), newVal)
+
+		}
+		return nil
+	})
 
 }
 
@@ -225,13 +225,13 @@ func main() {
 	for i := 0; i < 24; i++ {
 		sem <- true
 		go func(i int) {
-			<-sem
 			path, err := DownloadFiles(baseURL, i, date)
 			if err != nil {
 				fmt.Println(err)
 			} else {
 				filePaths[i] = path
 			}
+			<-sem
 		}(i)
 	}
 	// Defer until semaphore is completely flushed
@@ -245,16 +245,18 @@ func main() {
 		wg.Add(1)
 		go func(file string) {
 			defer wg.Done()
-			fmt.Println(file)
-			readFile(file)
+			if file != "" {
+				readFile(file)
+			}
 		}(file)
 	}
 	wg.Wait()
 	lineCount = 0
+	i = 0
 
 	// Loop through counters and sequentially write each one to to file.
 	for _, counter := range counterMap {
-		WriteToDB(counter, "2015-05-25")
+		WriteToDB(counter, "2015-05-24")
 	}
 	wg.Wait()
 }
