@@ -3,30 +3,35 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
-	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff"
+	"github.com/influxdb/influxdb/client"
 	"github.com/oleiade/lane"
+	"github.com/predata/gowiki/db"
 )
 
 var counterMap map[string]*WikiPageCounter
+var cl *db.Client
 var lineCount int
+var matchHTML *regexp.Regexp
+var matchChars *regexp.Regexp
+var matchDirs *regexp.Regexp
+var matchCtrl *regexp.Regexp
 
 // WikiPageCounter is a counter for the views for each wiki page for a given language.
 type WikiPageCounter struct {
 	language string
 	counter  map[string]uint32
-	db       *DB
 	mu       sync.Mutex
 }
 
@@ -115,12 +120,14 @@ func readFile(filePath string) {
 
 // ProcessLine parses and saves a line to the db
 func (counter *WikiPageCounter) ProcessLine(tokens []string, language string) {
-
-	if len(tokens) == 4 && strings.Index(tokens[1], ":") == -1 && strings.Index(tokens[1], "?") == -1 {
-		pageTitle, _ := url.QueryUnescape(tokens[1])
+	if len(tokens) == 4 && len(tokens[1]) < 255 && !matchHTML.MatchString(tokens[1]) && !matchChars.MatchString(tokens[1]) && !matchDirs.MatchString(tokens[1]) {
+		pageTitle := strings.Split(tokens[1], "#")[0]
+		pageTitle, _ = url.QueryUnescape(tokens[1])
+		pageTitle = strings.Replace(pageTitle, " ", "_", -1)
 		if len(pageTitle) == 0 {
 			return
 		}
+		pageTitle = url.QueryEscape(pageTitle)
 		pageViews, _ := strconv.ParseInt(tokens[2], 10, 64)
 
 		counter.mu.Lock()
@@ -133,22 +140,13 @@ func (counter *WikiPageCounter) ProcessLine(tokens []string, language string) {
 
 // CreateCounter creates a counter or returns the existing one.
 func CreateCounter(language string) *WikiPageCounter {
-
+	cl.CreateDB(language)
 	if counterMap[language] != nil {
 		return counterMap[language]
 	}
-	db := NewDB()
-	if err := db.Open(fmt.Sprintf("db/wiki_counts_%s", language)); err != nil {
-		log.Fatal(err)
-	}
-	db.Update(func(tx *Tx) error {
-		_, _ = tx.CreateBucketIfNotExists([]byte("pages"))
-		return nil
-	})
 	counterMap[language] = &WikiPageCounter{
 		language: language,
 		counter:  make(map[string]uint32),
-		db:       db,
 	}
 
 	return counterMap[language]
@@ -157,55 +155,76 @@ func CreateCounter(language string) *WikiPageCounter {
 // WriteToDB writes all values of a counter to its DB
 func WriteToDB(wpc *WikiPageCounter, date string) {
 	counter := wpc.counter
-	deque := lane.NewCappedDeque(5000)
+	deque := lane.NewCappedDeque(10000)
+	metricDate, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		metricDate = time.Now()
+	}
 	for title, views := range counter {
 		lineCount++
-		deque.Append(&dbPage{
-			pageTitle: title,
-			pageViews: views,
-			key:       date,
+		deque.Append(client.Point{
+			Measurement: title,
+			Fields: map[string]interface{}{
+				"count": views,
+			},
+			Time:      metricDate,
+			Precision: "n",
 		})
-		delete(counter, title)
 		if deque.Full() {
 			writeFromDeque(deque, wpc)
 		}
-
 	}
 	//Write remaining items at end of write cycle
 	writeFromDeque(deque, wpc)
 }
 
 func writeFromDeque(dq *lane.Deque, wpc *WikiPageCounter) {
+	pts := make([]client.Point, dq.Size())
+	i := 0
+	for !dq.Empty() {
+		pts[i] = dq.Pop().(client.Point)
+		i++
+	}
 
-	wpc.db.Update(func(tx *Tx) error {
-		for !dq.Empty() {
-			update := dq.Pop().(*dbPage)
-			titleBucket := tx.Bucket([]byte("pages"))
-			timeSeries := make(map[string]uint32)
-			title := titleBucket.Get([]byte(update.pageTitle))
-			if title != nil {
-				json.Unmarshal(title, &timeSeries)
+	bps := client.BatchPoints{
+		Points:          pts,
+		Database:        wpc.language,
+		RetentionPolicy: "default",
+	}
+	retryOperation := func() error {
+		_, err := cl.Write(bps)
+		return err
+	}
+
+	err := backoff.Retry(retryOperation, backoff.NewExponentialBackOff())
+
+	if err != nil {
+		sleepLength := 100
+		for {
+			time.Sleep(time.Duration(sleepLength) * time.Millisecond)
+			_, err := cl.Write(bps)
+			if err == nil {
+				break
 			}
-			timeSeries[update.key] = update.pageViews
-			newVal, _ := json.Marshal(timeSeries)
-			titleBucket.Put([]byte(update.pageTitle), newVal)
-
+			sleepLength = sleepLength * 2
 		}
-		return nil
-	})
-
+	}
 }
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
 	counterMap = make(map[string]*WikiPageCounter)
 
-	os.Mkdir("db", 0777)
+	matchHTML, _ = regexp.Compile(`&#?[0-9A-Za-z]+;`)
+	matchChars, _ = regexp.Compile(`[<>\[\]|\{\}:]`)
+	matchDirs, _ = regexp.Compile(`^.\/|^..\/|\/.\/|\/..\/|\/.$|\/..$`)
+	matchCtrl, _ = regexp.Compile(`[[:cntrl:]]`)
+
+	cl = db.Open()
 	for _, wikiType := range WikiTypes {
 		CreateCounter(wikiType)
-		// Sleep so inserts are staggered to mitigate disk thrashing
-		time.Sleep(50)
 	}
+
+	// Temp for loop to get metrics about write performance
 	i := 0
 	go func() {
 		for {
@@ -219,10 +238,10 @@ func main() {
 	// t := time.Now().Format("2006/2006-01/pagecounts-20060102")
 	// file := fmt.Sprintf("%s", t)
 	date, _ := time.Parse("2006-01-02", "2015-05-24")
-	concurrency := 2
+	concurrency := 1
 	sem := make(chan bool, concurrency)
-	filePaths := make([]string, 24)
-	for i := 0; i < 24; i++ {
+	filePaths := make([]string, 1)
+	for i := 0; i < 1; i++ {
 		sem <- true
 		go func(i int) {
 			path, err := DownloadFiles(baseURL, i, date)
